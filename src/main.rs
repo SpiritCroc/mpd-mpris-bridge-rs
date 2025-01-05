@@ -28,6 +28,14 @@ async fn main() -> anyhow::Result<()> {
                 return;
             }
 
+            let mut state = MpdQueryState {
+                in_command_list: false,
+                in_command_list_ok: false,
+                command_list_ended: false,
+                command_list_count: 0,
+                command_list_failed: false,
+            };
+
             loop {
                 debug!("Reading from {addr}...");
                 let n = match socket.read(&mut buf).await {
@@ -44,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
                 };
 
                 // Handle commands
-                if let Err(e) = handle_mpd_queries(&mut socket, &buf[0..n]).await {
+                if let Err(e) = handle_mpd_queries(&mut socket, &buf[0..n], &mut state).await {
                     warn!("Failed to handle MPD queries: {:?}", e);
                     return;
                 }
@@ -59,16 +67,46 @@ struct MpdQueryState {
     in_command_list_ok: bool,
     command_list_ended: bool,
     command_list_count: usize,
+    command_list_failed: bool,
 }
 
-async fn handle_mpd_queries(socket: &mut TcpStream, commands: &[u8]) -> anyhow::Result<()> {
+#[derive(Debug)]
+struct MpdCommandError {
+    //command: Vec<u8>,
+    command_str: String,
+    message: String,
+    mpd_error_code: i8,
+}
+impl std::error::Error for MpdCommandError {}
+impl std::fmt::Display for MpdCommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "Command {} failed: {}", self.command_str, self.message)
+    }
+}
+
+fn safe_command_print(command: &[u8]) -> &str {
+    match std::str::from_utf8(&command) {
+        Ok(s) => s,
+        Err(_) => "[un-utf8 command]"
+    }
+}
+
+impl MpdCommandError {
+    pub fn new(command: &[u8], message: &str) -> MpdCommandError {
+        let command_str = safe_command_print(&command);
+        MpdCommandError {
+            //command: command.to_vec(),
+            command_str: command_str.to_string(),
+            message: message.to_string(),
+            // Error codes: https://github.com/MusicPlayerDaemon/MPD/blob/master/src/protocol/Ack.hxx
+            // 5 is unknown
+            mpd_error_code: 5,
+        }
+    }
+}
+
+async fn handle_mpd_queries(socket: &mut TcpStream, commands: &[u8], state: &mut MpdQueryState) -> anyhow::Result<()> {
     let mut remainder = commands.to_vec();
-    let mut state = MpdQueryState {
-        in_command_list: false,
-        in_command_list_ok: false,
-        command_list_ended: false,
-        command_list_count: 0,
-    };
     loop {
         if remainder.is_empty() {
             break;
@@ -81,7 +119,7 @@ async fn handle_mpd_queries(socket: &mut TcpStream, commands: &[u8]) -> anyhow::
             Some(i) => remainder.split_off(i),
             None => remainder.clone()
         };
-        match handle_mpd_query(&remainder, &mut state).await {
+        match handle_mpd_query(&remainder, state).await {
             Ok(response) => {
                 socket.write_all(&response).await?;
                 if state.command_list_ended {
@@ -92,10 +130,9 @@ async fn handle_mpd_queries(socket: &mut TcpStream, commands: &[u8]) -> anyhow::
             }
             Err(e) => {
                 warn!("Handling MPD query failed. {}", e);
-                // TODO replace "hmmm" with command name, and replace `2` with some appropriate
-                //  error code number
-                let error_response = format!("ACK [2@{}] hmmm {}", state.command_list_count, e);
+                let error_response = format!("ACK [{}@{}] {} {}\n", e.mpd_error_code, e.command_str, state.command_list_count, e);
                 socket.write_all(&error_response.as_bytes()).await?;
+                break;
             }
         }
         remainder = new_remainder;
@@ -111,12 +148,16 @@ async fn handle_mpd_queries(socket: &mut TcpStream, commands: &[u8]) -> anyhow::
 }
 
 /// Execute a query and returns the response to send back
-async fn handle_mpd_query(command: &[u8], state: &mut MpdQueryState) -> anyhow::Result<Vec<u8>> {
+async fn handle_mpd_query(command: &[u8], state: &mut MpdQueryState) -> Result<Vec<u8>, MpdCommandError> {
     // TODO do things https://docs.rs/mpris/latest/mpris/
     // Compare also https://github.com/SpiritCroc/mpd-mpris-bridge/blob/master/index.js
     // And https://github.com/depuits/mpd-server
     // TODO more re-usable command parsing
-    match command {
+    if state.command_list_failed && command != b"command_list_end" {
+        debug!("Ignore list command while in failed state: {}", safe_command_print(command));
+        return Ok(Vec::new())
+    };
+    let result = match command {
         // Health
         b"ping" => handle_ping(),
         // Playback
@@ -150,26 +191,23 @@ async fn handle_mpd_query(command: &[u8], state: &mut MpdQueryState) -> anyhow::
         b"playlistinfo" => handle_dummy("playlistinfo"),
         b"close" => handle_dummy("close"),
         _ => handle_unknown_command(command)
-    }
+    };
+    result.map_err(|e|
+        MpdCommandError::new(command, &format!("{:?}", e))
+    )
 }
 
 fn get_mpris_player() -> anyhow::Result<Player> {
     // TODO should I cache dbus connections or players, how fast is re-querying here?
+    // TODO if no active found, should try to re-use the one which was active last, if available
     let player = PlayerFinder::new()?.find_active()?;
     Ok(player)
 }
 
 fn handle_ping() -> anyhow::Result<Vec<u8>> {
-    match get_mpris_player() {
-        Ok(_) => {
-            debug!("Ping received, return OK");
-            Ok(b"OK\n".to_vec())
-        }
-        Err(e) => {
-            debug!("Ping failed: {:?}", e);
-            Err(e)
-        }
-    }
+    let _ = get_mpris_player()?;
+    debug!("Ping successful, return OK");
+    Ok(b"OK\n".to_vec())
 }
 
 fn handle_play() -> anyhow::Result<Vec<u8>> {
@@ -203,17 +241,18 @@ fn handle_previous() -> anyhow::Result<Vec<u8>> {
 }
 
 fn handle_current_song() -> anyhow::Result<Vec<u8>> {
-    // TODO
-    let file = "";
-    let title = "";
-    let artist = "";
-    let time = 0;
-    let duration = 0;
+    let player = get_mpris_player()?;
+    let metadata = player.get_metadata()?;
+    let file = metadata.url().unwrap_or_default();
+    let title = metadata.title().unwrap_or_default();
+    let artist = metadata.artists().unwrap_or_default().join(", ");
+    let duration = metadata.length().unwrap_or_default();
+    let duration = duration.as_secs_f32();
     let art_url = "";
     let response = format!("file: {file}\n\
                             Title: {title}\n\
                             Artist: {artist}\n\
-                            Time: {time}\n\
+                            Time: {duration}\n\
                             duration: {duration}\n\
                             arturl: {art_url}\n");
     debug!("Handled current song: {title}");
@@ -221,16 +260,24 @@ fn handle_current_song() -> anyhow::Result<Vec<u8>> {
 }
 
 fn handle_status() -> anyhow::Result<Vec<u8>> {
-    // TODO
-    let state = "";
-    let time = 0;
-    let elapsed = 0;
-    let art_url = "";
+    let player = get_mpris_player()?;
+    // https://mpd.readthedocs.io/en/latest/protocol.html
+    let state = match player.get_playback_status()? {
+        mpris::PlaybackStatus::Playing => "play",
+        mpris::PlaybackStatus::Paused => "pause",
+        mpris::PlaybackStatus::Stopped => "stop"
+    };
+    let metadata = player.get_metadata()?;
+    let duration = metadata.length().unwrap_or_default();
+    let duration = duration.as_secs_f32();
+    let elapsed = player.get_position().ok().unwrap_or_default();
+    let elapsed = elapsed.as_secs_f32();
+    let art_url = metadata.art_url().unwrap_or_default();
     let response = format!("repeat: 0\n\
                             random: 0\n\
                             playlistlength: 1\n\
                             state: {state}\n\
-                            time: {time}\n\
+                            time: {duration}\n\
                             elapsed: {elapsed}\n\
                             arturl: {art_url}\n");
     debug!("Handled status: {state}");
@@ -238,11 +285,9 @@ fn handle_status() -> anyhow::Result<Vec<u8>> {
 }
 
 fn handle_unknown_command(command: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let err = match std::str::from_utf8(command) {
-        Ok(s) => anyhow::anyhow!("Unknown command: {s}"),
-        Err(_) => anyhow::anyhow!("Unknown non-UTF8 command"),
-    };
-    Err(err)
+    let safe_command = safe_command_print(command);
+    debug!("Ignoring unknown command: {safe_command}");
+    Err(anyhow::anyhow!("Unknown command: {safe_command}"))
 }
 
 fn handle_dummy(name: &str) -> anyhow::Result<Vec<u8>> {
