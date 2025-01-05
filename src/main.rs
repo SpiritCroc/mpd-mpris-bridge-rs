@@ -1,6 +1,6 @@
 use log::{debug, info, warn};
 
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use mpris::{PlayerFinder, Player};
@@ -28,7 +28,6 @@ async fn main() -> anyhow::Result<()> {
                 return;
             }
 
-            // In a loop, read data from the socket and write the data back.
             loop {
                 debug!("Reading from {addr}...");
                 let n = match socket.read(&mut buf).await {
@@ -44,9 +43,9 @@ async fn main() -> anyhow::Result<()> {
                     }
                 };
 
-                // Write the data back
-                if let Err(e) = socket.write_all(&handle_mpd_query(&buf[0..n]).await).await {
-                    warn!("Failed to write to socket; err = {:?}", e);
+                // Handle commands
+                if let Err(e) = handle_mpd_queries(&mut socket, &buf[0..n]).await {
+                    warn!("Failed to handle MPD queries: {:?}", e);
                     return;
                 }
                 debug!("Done reading {n} from {addr}");
@@ -55,35 +54,102 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn handle_mpd_query(command: &[u8]) -> Vec<u8> {
+struct MpdQueryState {
+    in_command_list: bool,
+    in_command_list_ok: bool,
+    command_list_ended: bool,
+    command_list_count: usize,
+}
+
+async fn handle_mpd_queries(socket: &mut TcpStream, commands: &[u8]) -> anyhow::Result<()> {
+    let mut remainder = commands.to_vec();
+    let mut state = MpdQueryState {
+        in_command_list: false,
+        in_command_list_ok: false,
+        command_list_ended: false,
+        command_list_count: 0,
+    };
+    loop {
+        if remainder.is_empty() {
+            break;
+        }
+        if remainder[0] == b'\n' {
+            remainder.remove(0);
+            continue;
+        }
+        let new_remainder = match remainder.iter().position(|&b| b == b'\n' || b == b'\r') {
+            Some(i) => remainder.split_off(i),
+            None => remainder.clone()
+        };
+        match handle_mpd_query(&remainder, &mut state).await {
+            Ok(response) => {
+                socket.write_all(&response).await?;
+                if state.command_list_ended {
+                    socket.write_all(&b"OK\n".to_vec()).await?;
+                } else if state.in_command_list_ok && state.command_list_count > 0 {
+                    socket.write_all(&b"list_OK\n".to_vec()).await?;
+                }
+            }
+            Err(e) => {
+                warn!("Handling MPD query failed. {}", e);
+                // TODO replace "hmmm" with command name, and replace `2` with some appropriate
+                //  error code number
+                let error_response = format!("ACK [2@{}] hmmm {}", state.command_list_count, e);
+                socket.write_all(&error_response.as_bytes()).await?;
+            }
+        }
+        remainder = new_remainder;
+        if state.command_list_ended {
+            state.in_command_list = false;
+            state.in_command_list_ok = false;
+            state.command_list_ended = false;
+        } else if state.in_command_list {
+            state.command_list_count += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Execute a query and returns the response to send back
+async fn handle_mpd_query(command: &[u8], state: &mut MpdQueryState) -> anyhow::Result<Vec<u8>> {
     // TODO do things https://docs.rs/mpris/latest/mpris/
     // Compare also https://github.com/SpiritCroc/mpd-mpris-bridge/blob/master/index.js
     // And https://github.com/depuits/mpd-server
     // TODO more re-usable command parsing
-    let result = match command {
+    match command {
         // Health
-        b"ping\n" => handle_ping(),
+        b"ping" => handle_ping(),
         // Playback
-        b"play\n" => handle_play(),
-        b"pause \"1\"\n" => handle_pause(),
-        b"pause\n" => handle_pause(),
-        b"stop\n" => handle_stop(),
-        b"next\n" => handle_next(),
-        b"previous\n" => handle_previous(),
+        b"play" => handle_play(),
+        b"pause \"1\"" => handle_pause(),
+        b"pause" => handle_pause(),
+        b"stop" => handle_stop(),
+        b"next" => handle_next(),
+        b"previous" => handle_previous(),
         // Infos
-        b"currentsong\n" => handle_current_song(),
-        b"status\n" => handle_status(),
-        // Unsupported commands
-        b"playlistinfo\n" => handle_dummy("playlistinfo"),
-        b"close\n" => handle_dummy("close"),
-        _ => handle_unknown_command(command)
-    };
-    return match result {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("Handling MPD query failed: {}", e);
-            vec!(b'\n')
+        b"currentsong" => handle_current_song(),
+        b"status" => handle_status(),
+        // Aggregating commands
+        b"command_list_begin" => {
+            debug!("Received command_list_begin");
+            state.in_command_list = true;
+            Ok(Vec::new())
         }
+        b"command_list_ok_begin" => {
+            debug!("Received command_list_ok_begin");
+            state.in_command_list = true;
+            state.in_command_list_ok = true;
+            Ok(Vec::new())
+        }
+        b"command_list_end" => {
+            debug!("Received command_list_end");
+            state.command_list_ended = true;
+            Ok(Vec::new())
+        }
+        // Unsupported commands
+        b"playlistinfo" => handle_dummy("playlistinfo"),
+        b"close" => handle_dummy("close"),
+        _ => handle_unknown_command(command)
     }
 }
 
@@ -150,6 +216,7 @@ fn handle_current_song() -> anyhow::Result<Vec<u8>> {
                             Time: {time}\n\
                             duration: {duration}\n\
                             arturl: {art_url}\n");
+    debug!("Handled current song: {title}");
     Ok(response.into())
 }
 
@@ -166,6 +233,7 @@ fn handle_status() -> anyhow::Result<Vec<u8>> {
                             time: {time}\n\
                             elapsed: {elapsed}\n\
                             arturl: {art_url}\n");
+    debug!("Handled status: {state}");
     Ok(response.into())
 }
 
