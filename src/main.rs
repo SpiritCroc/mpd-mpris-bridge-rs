@@ -122,6 +122,9 @@ async fn handle_mpd_queries(socket: &mut TcpStream, commands: &[u8], state: &mut
             Some(i) => remainder.split_off(i),
             None => remainder.clone()
         };
+        if remainder.is_empty() {
+            continue;
+        }
         match handle_mpd_query(&remainder, state).await {
             Ok(response) => {
                 if response.len() > 0 {
@@ -279,11 +282,8 @@ fn handle_current_song() -> anyhow::Result<Vec<u8>> {
     let metadata = player.get_metadata()?;
     let mut response: Vec<u8> = Vec::new();
 
-    if let Some(file) = metadata.url() {
-        response.append(&mut format!("file: {file}\n").into());
-    };
     if let Some(title) = metadata.title() {
-        response.append(&mut format!("Title: {title}\n").into());
+        response.append(&mut format!("file: {title}\nTitle: {title}\n").into());
     };
     if let Some(artist) = metadata.artists().map(|a| a.join(", ")) {
         response.append(&mut format!("Artist: {artist}\n").into());
@@ -318,11 +318,15 @@ fn handle_status() -> anyhow::Result<Vec<u8>> {
              state: {state}\n"
         ).into();
 
-    if let Some(duration) = metadata.length().map(|d| d.as_secs_f32()) {
-        response.append(&mut format!("duration: {duration:.3}\n").into());
+    let duration = metadata.length().map(|d| d.as_secs_f32());
+    if let Some(duration) = duration {
+        response.append(&mut format!("duration: {duration}\n").into());
     };
-    if let Ok(elapsed) = player.get_position() {
-        response.append(&mut format!("elapsed: {:.3}\n", elapsed.as_secs_f32()).into());
+    if let Ok(elapsed) = player.get_position().map(|d| d.as_secs_f32()) {
+        response.append(&mut format!("elapsed: {elapsed}\n").into());
+        if let Some(duration) = duration {
+            response.append(&mut format!("time: {elapsed}:{duration}\n").into());
+        }
     };
     if let Some(art_url) = metadata.art_url() {
         response.append(&mut format!("arturl: {art_url}\n").into());
