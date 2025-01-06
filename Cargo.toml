@@ -1,5 +1,5 @@
 [package]
-name = "mpd-mpris-bridge-rs"
+name = "mpd-mpris-bridge"
 version = "0.1.0"
 edition = "2021"
 

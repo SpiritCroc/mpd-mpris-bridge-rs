@@ -13,7 +13,7 @@ async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
     //TODO config
     info!("Binding to address...");
-    let listener = TcpListener::bind("0.0.0.0:6602").await?;
+    let listener = TcpListener::bind("0.0.0.0:6601").await?;
     info!("Bound to address, listening...");
 
     loop {
@@ -21,11 +21,12 @@ async fn main() -> anyhow::Result<()> {
         info!("Connected client {addr}");
 
         tokio::spawn(async move {
-            // Greeting as per spec https://mpd.readthedocs.io/en/latest/protocol.html
             let mut buf = [0; 1024];
             if let Err(e) = socket.set_nodelay(true) {
                 warn!("Failed to set nodelay: {:?}", e);
             }
+
+            // Send initial greeting
             if let Err(e) = socket.write_all(b"OK MPD 0.23.16\n").await {
                 warn!("Failed to write to socket; err = {:?}", e);
                 return;
@@ -167,10 +168,7 @@ async fn handle_mpd_query(command: &[u8], state: &mut MpdQueryState) -> Result<V
         Some(i) => (&command[0..i], &command[i+1..command.len()]),
         None => (command, &[] as &[u8])
     };
-    // TODO do things https://docs.rs/mpris/latest/mpris/
-    // Compare also https://github.com/SpiritCroc/mpd-mpris-bridge/blob/master/index.js
-    // And https://github.com/depuits/mpd-server
-    // TODO more re-usable command parsing
+    // TODO more re-usable command parsing?
     if state.command_list_failed && command != b"command_list_end" {
         debug!("Ignore list command while in failed state: {}", safe_command_print(command));
         return Ok(Vec::new())
@@ -235,8 +233,6 @@ async fn handle_mpd_query(command: &[u8], state: &mut MpdQueryState) -> Result<V
 }
 
 fn get_mpris_player() -> anyhow::Result<Player> {
-    // TODO should I cache dbus connections or players, how fast is re-querying here?
-    // TODO if no active found, should try to re-use the one which was active last, if available
     let player = PlayerFinder::new()?.find_active()?;
     Ok(player)
 }
