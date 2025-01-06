@@ -1,4 +1,4 @@
-use log::{debug, info, warn};
+use log::{trace, debug, info, warn};
 
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -121,16 +121,24 @@ async fn handle_mpd_queries(socket: &mut TcpStream, commands: &[u8], state: &mut
         };
         match handle_mpd_query(&remainder, state).await {
             Ok(response) => {
-                socket.write_all(&response).await?;
-                if state.command_list_ended {
+                if response.len() > 0 {
+                    trace!("Respond {}", safe_command_print(&response));
+                    socket.write_all(&response).await?;
+                }
+                if state.in_command_list_ok && !state.command_list_ended {
+                    if state.command_list_count > 0 {
+                        trace!("Respond list_OK");
+                        socket.write_all(&b"list_OK\n".to_vec()).await?;
+                    }
+                } else {
+                    trace!("Respond OK");
                     socket.write_all(&b"OK\n".to_vec()).await?;
-                } else if state.in_command_list_ok && state.command_list_count > 0 {
-                    socket.write_all(&b"list_OK\n".to_vec()).await?;
                 }
             }
             Err(e) => {
                 warn!("Handling MPD query failed. {}", e);
                 let error_response = format!("ACK [{}@{}] {} {}\n", e.mpd_error_code, e.command_str, state.command_list_count, e);
+                trace!("Respond {}", error_response);
                 socket.write_all(&error_response.as_bytes()).await?;
                 break;
             }
@@ -206,82 +214,95 @@ fn get_mpris_player() -> anyhow::Result<Player> {
 
 fn handle_ping() -> anyhow::Result<Vec<u8>> {
     let _ = get_mpris_player()?;
-    debug!("Ping successful, return OK");
-    Ok(b"OK\n".to_vec())
+    debug!("Ping successful");
+    Ok(Vec::new())
 }
 
 fn handle_play() -> anyhow::Result<Vec<u8>> {
     get_mpris_player()?.play()?;
     debug!("Handled play action");
-    Ok(vec!(b'\n'))
+    Ok(Vec::new())
 }
 
 fn handle_pause() -> anyhow::Result<Vec<u8>> {
     get_mpris_player()?.pause()?;
     debug!("Handled pause action");
-    Ok(vec!(b'\n'))
+    Ok(Vec::new())
 }
 
 fn handle_stop() -> anyhow::Result<Vec<u8>> {
     get_mpris_player()?.stop()?;
     debug!("Handled stop action");
-    Ok(vec!(b'\n'))
+    Ok(Vec::new())
 }
 
 fn handle_next() -> anyhow::Result<Vec<u8>> {
     get_mpris_player()?.next()?;
     debug!("Handled next action");
-    Ok(vec!(b'\n'))
+    Ok(Vec::new())
 }
 
 fn handle_previous() -> anyhow::Result<Vec<u8>> {
     get_mpris_player()?.previous()?;
     debug!("Handled previous action");
-    Ok(vec!(b'\n'))
+    Ok(Vec::new())
 }
 
 fn handle_current_song() -> anyhow::Result<Vec<u8>> {
     let player = get_mpris_player()?;
     let metadata = player.get_metadata()?;
-    let file = metadata.url().unwrap_or_default();
-    let title = metadata.title().unwrap_or_default();
-    let artist = metadata.artists().unwrap_or_default().join(", ");
-    let duration = metadata.length().unwrap_or_default();
-    let duration = duration.as_secs_f32();
-    let art_url = "";
-    let response = format!("file: {file}\n\
-                            Title: {title}\n\
-                            Artist: {artist}\n\
-                            Time: {duration}\n\
-                            duration: {duration}\n\
-                            arturl: {art_url}\n");
-    debug!("Handled current song: {title}");
+    let mut response: Vec<u8> = Vec::new();
+
+    if let Some(file) = metadata.url() {
+        response.append(&mut format!("file: {file}\n").into());
+    };
+    if let Some(title) = metadata.title() {
+        response.append(&mut format!("Title: {title}\n").into());
+    };
+    if let Some(artist) = metadata.artists().map(|a| a.join(", ")) {
+        response.append(&mut format!("Artist: {artist}\n").into());
+    };
+    if let Some(duration) = metadata.length().map(|d| d.as_secs_f32()) {
+        response.append(&mut format!("Time: {duration}\nduration: {duration:.3}\n").into());
+    };
+    if let Some(art_url) = metadata.art_url() {
+        response.append(&mut format!("arturl: {art_url}\n").into());
+    };
+    debug!("Handled current song");
     Ok(response.into())
 }
 
 fn handle_status() -> anyhow::Result<Vec<u8>> {
     let player = get_mpris_player()?;
+    let metadata = player.get_metadata()?;
+
     // https://mpd.readthedocs.io/en/latest/protocol.html
     let state = match player.get_playback_status()? {
         mpris::PlaybackStatus::Playing => "play",
         mpris::PlaybackStatus::Paused => "pause",
         mpris::PlaybackStatus::Stopped => "stop"
     };
-    let metadata = player.get_metadata()?;
-    let duration = metadata.length().unwrap_or_default();
-    let duration = duration.as_secs_f32();
-    let elapsed = player.get_position().ok().unwrap_or_default();
-    let elapsed = elapsed.as_secs_f32();
-    let art_url = metadata.art_url().unwrap_or_default();
-    let response = format!("repeat: 0\n\
-                            random: 0\n\
-                            playlistlength: 1\n\
-                            state: {state}\n\
-                            time: {duration}\n\
-                            elapsed: {elapsed}\n\
-                            arturl: {art_url}\n");
+
+    let response: &mut Vec<u8> =
+        &mut format!(
+            "repeat: 0\n\
+             random: 0\n\
+             song: 0\n\
+             playlistlength: 1\n\
+             state: {state}\n"
+        ).into();
+
+    if let Some(duration) = metadata.length().map(|d| d.as_secs_f32()) {
+        response.append(&mut format!("duration: {duration:.3}\n").into());
+    };
+    if let Ok(elapsed) = player.get_position() {
+        response.append(&mut format!("elapsed: {:.3}\n", elapsed.as_secs_f32()).into());
+    };
+    if let Some(art_url) = metadata.art_url() {
+        response.append(&mut format!("arturl: {art_url}\n").into());
+    };
     debug!("Handled status: {state}");
-    Ok(response.into())
+    Ok(response.to_vec())
 }
 
 fn handle_unknown_command(command: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -292,5 +313,5 @@ fn handle_unknown_command(command: &[u8]) -> anyhow::Result<Vec<u8>> {
 
 fn handle_dummy(name: &str) -> anyhow::Result<Vec<u8>> {
     debug!("Handling dummy action {name}");
-    Ok(vec!(b'\n'))
+    Ok(Vec::new())
 }
