@@ -1,7 +1,10 @@
 use log::{trace, debug, info, warn};
 
+use std::time::Duration;
+
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::sleep;
 
 use mpris::{PlayerFinder, Player};
 
@@ -157,6 +160,10 @@ async fn handle_mpd_queries(socket: &mut TcpStream, commands: &[u8], state: &mut
 
 /// Execute a query and returns the response to send back
 async fn handle_mpd_query(command: &[u8], state: &mut MpdQueryState) -> Result<Vec<u8>, MpdCommandError> {
+    let (command, arguments) = match command.iter().position(|&b| b == b' ') {
+        Some(i) => (&command[0..i], &command[i+1..command.len()]),
+        None => (command, &[] as &[u8])
+    };
     // TODO do things https://docs.rs/mpris/latest/mpris/
     // Compare also https://github.com/SpiritCroc/mpd-mpris-bridge/blob/master/index.js
     // And https://github.com/depuits/mpd-server
@@ -170,14 +177,33 @@ async fn handle_mpd_query(command: &[u8], state: &mut MpdQueryState) -> Result<V
         b"ping" => handle_ping(),
         // Playback
         b"play" => handle_play(),
-        b"pause \"1\"" => handle_pause(),
-        b"pause" => handle_pause(),
-        b"stop" => handle_stop(),
+        b"pause" => {
+            match arguments {
+                b"1" => handle_pause(),
+                b"\"1\"" => handle_pause(),
+                b"" => handle_pause(),
+                _ => {
+                    debug!("Pause command with arguments {} mapped to play", safe_command_print(arguments));
+                    handle_play()
+                }
+            }
+        }
+        b"stop" => {
+            // Some clients don't properly support stop, in which case pause is good enough
+            match handle_stop() {
+                Err(e) => {
+                    warn!("Handling stop failed, try with pause instead: {:?}", e);
+                    handle_pause()
+                }
+                v => v
+            }
+        }
         b"next" => handle_next(),
         b"previous" => handle_previous(),
         // Infos
         b"currentsong" => handle_current_song(),
         b"status" => handle_status(),
+        b"idle" => handle_idle(arguments).await,
         // Aggregating commands
         b"command_list_begin" => {
             debug!("Received command_list_begin");
@@ -303,6 +329,30 @@ fn handle_status() -> anyhow::Result<Vec<u8>> {
     };
     debug!("Handled status: {state}");
     Ok(response.to_vec())
+}
+
+fn get_player_state_for_idle() -> anyhow::Result<(mpris::PlaybackStatus, std::collections::HashMap<String, mpris::MetadataValue>)> {
+    let player = get_mpris_player()?;
+    let status = player.get_playback_status()?;
+    let metadata: std::collections::HashMap<_, _> = player.get_metadata()?.into();
+    Ok((status, metadata))
+}
+
+async fn handle_idle(arguments: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let arguments = std::str::from_utf8(&arguments)?;
+    if arguments.len() > 0 && !arguments.contains("\"player\"") {
+        return Err(anyhow::anyhow!("No supported subsystem in {}", arguments));
+    }
+    debug!("Handling idle... subsystems: {}", arguments);
+    let initial_player_state = get_player_state_for_idle()?;
+    let sleep_duration = Duration::from_millis(333);
+    loop {
+        sleep(sleep_duration).await;
+        if get_player_state_for_idle()? != initial_player_state {
+            debug!("Handling idle finished with player status change");
+            return Ok(b"changed: player\n".to_vec());
+        }
+    }
 }
 
 fn handle_unknown_command(command: &[u8]) -> anyhow::Result<Vec<u8>> {
