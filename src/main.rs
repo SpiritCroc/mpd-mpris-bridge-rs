@@ -238,7 +238,6 @@ fn get_mpris_player() -> anyhow::Result<Player> {
 }
 
 fn handle_ping() -> anyhow::Result<Vec<u8>> {
-    let _ = get_mpris_player()?;
     debug!("Ping successful");
     Ok(Vec::new())
 }
@@ -274,7 +273,10 @@ fn handle_previous() -> anyhow::Result<Vec<u8>> {
 }
 
 fn handle_current_song() -> anyhow::Result<Vec<u8>> {
-    let player = get_mpris_player()?;
+    let Ok(player) = get_mpris_player() else {
+        info!("Handled current song without player");
+        return Ok(Vec::new());
+    };
     let metadata = player.get_metadata()?;
     let mut response: Vec<u8> = Vec::new();
 
@@ -295,7 +297,14 @@ fn handle_current_song() -> anyhow::Result<Vec<u8>> {
 }
 
 fn handle_status() -> anyhow::Result<Vec<u8>> {
-    let player = get_mpris_player()?;
+    let Ok(player) = get_mpris_player() else {
+        info!("Handled status without player");
+        return Ok("repeat: 0\n\
+                   random: 0\n\
+                   song: 0\n\
+                   playlistlength: 0\n\
+                   state: stop\n".into());
+    };
     let metadata = player.get_metadata()?;
 
     // https://mpd.readthedocs.io/en/latest/protocol.html
@@ -344,11 +353,11 @@ async fn handle_idle(arguments: &[u8]) -> anyhow::Result<Vec<u8>> {
         return Err(anyhow::anyhow!("No supported subsystem in {}", arguments));
     }
     debug!("Handling idle... subsystems: {}", arguments);
-    let initial_player_state = get_player_state_for_idle()?;
+    let initial_player_state = get_player_state_for_idle().ok();
     let sleep_duration = Duration::from_millis(333);
     loop {
         sleep(sleep_duration).await;
-        if get_player_state_for_idle()? != initial_player_state {
+        if get_player_state_for_idle().ok() != initial_player_state {
             debug!("Handling idle finished with player status change");
             return Ok(b"changed: player\n".to_vec());
         }
