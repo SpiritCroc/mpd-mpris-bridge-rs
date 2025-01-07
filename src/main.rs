@@ -38,6 +38,7 @@ async fn main() -> anyhow::Result<()> {
                 command_list_ended: false,
                 command_list_count: 0,
                 command_list_failed: false,
+                last_idle_state: None,
             };
 
             loop {
@@ -72,6 +73,7 @@ struct MpdQueryState {
     command_list_ended: bool,
     command_list_count: usize,
     command_list_failed: bool,
+    last_idle_state: Option<(mpris::PlaybackStatus, std::collections::HashMap<String, mpris::MetadataValue>)>,
 }
 
 #[derive(Debug)]
@@ -126,7 +128,7 @@ async fn handle_mpd_queries(socket: &mut TcpStream, commands: &[u8], state: &mut
         if remainder.is_empty() {
             continue;
         }
-        match handle_mpd_query(&remainder, state).await {
+        match handle_mpd_query(&remainder, state, socket).await {
             Ok(response) => {
                 if response.len() > 0 {
                     trace!("Respond {}", safe_command_print(&response));
@@ -163,7 +165,7 @@ async fn handle_mpd_queries(socket: &mut TcpStream, commands: &[u8], state: &mut
 }
 
 /// Execute a query and returns the response to send back
-async fn handle_mpd_query(command: &[u8], state: &mut MpdQueryState) -> Result<Vec<u8>, MpdCommandError> {
+async fn handle_mpd_query(command: &[u8], state: &mut MpdQueryState, socket: &mut TcpStream) -> Result<Vec<u8>, MpdCommandError> {
     let (command, arguments) = match command.iter().position(|&b| b == b' ') {
         Some(i) => (&command[0..i], &command[i+1..command.len()]),
         None => (command, &[] as &[u8])
@@ -174,8 +176,10 @@ async fn handle_mpd_query(command: &[u8], state: &mut MpdQueryState) -> Result<V
         return Ok(Vec::new())
     };
     let result = match command {
-        // Health
+        // Health/static commands
         b"ping" => handle_ping(),
+        b"commands" => handle_commands(),
+        b"tagtypes" => handle_tagtypes(),
         // Playback
         b"play" => handle_play(),
         b"pause" => {
@@ -204,7 +208,7 @@ async fn handle_mpd_query(command: &[u8], state: &mut MpdQueryState) -> Result<V
         // Infos
         b"currentsong" => handle_current_song(),
         b"status" => handle_status(),
-        b"idle" => handle_idle(arguments).await,
+        b"idle" => handle_idle(arguments, state, socket).await,
         // Aggregating commands
         b"command_list_begin" => {
             debug!("Received command_list_begin");
@@ -222,9 +226,13 @@ async fn handle_mpd_query(command: &[u8], state: &mut MpdQueryState) -> Result<V
             state.command_list_ended = true;
             Ok(Vec::new())
         }
-        // Unsupported commands
+        // Silently ignored commands
         b"playlistinfo" => handle_dummy("playlistinfo"),
+        b"lsinfo" => handle_dummy("lsinfo"),
+        b"stats" => handle_dummy("stats"),
         b"close" => handle_dummy("close"),
+        b"setvol" => handle_dummy("setvol"),
+        b"noidle" => handle_dummy("noidle"),
         _ => handle_unknown_command(command)
     };
     result.map_err(|e|
@@ -241,6 +249,33 @@ fn handle_ping() -> anyhow::Result<Vec<u8>> {
     debug!("Ping successful");
     Ok(Vec::new())
 }
+
+fn handle_commands() -> anyhow::Result<Vec<u8>> {
+    debug!("Returning supported commands");
+    Ok("command: close\n\
+        command: commands\n\
+        command: currentsong\n\
+        command: idle\n\
+        command: lsinfo\n\
+        command: next\n\
+        command: pause\n\
+        command: ping\n\
+        command: play\n\
+        command: playlistinfo\n\
+        command: previous\n\
+        command: stats\n\
+        command: status\n\
+        command: stop\n\
+        command: tagtypes\n".into())
+}
+
+fn handle_tagtypes() -> anyhow::Result<Vec<u8>> {
+    debug!("Returning supported tagtypes");
+    Ok("tagtype: Artist\n\
+        tagtype: Album\n\
+        tagtype: Title\n".into())
+}
+
 
 fn handle_play() -> anyhow::Result<Vec<u8>> {
     get_mpris_player()?.play()?;
@@ -347,20 +382,32 @@ fn get_player_state_for_idle() -> anyhow::Result<(mpris::PlaybackStatus, std::co
     Ok((status, metadata))
 }
 
-async fn handle_idle(arguments: &[u8]) -> anyhow::Result<Vec<u8>> {
+async fn handle_idle(arguments: &[u8], state: &mut MpdQueryState, socket: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
     let arguments = std::str::from_utf8(&arguments)?;
     if arguments.len() > 0 && !arguments.contains("\"player\"") {
         return Err(anyhow::anyhow!("No supported subsystem in {}", arguments));
     }
     debug!("Handling idle... subsystems: {}", arguments);
-    let initial_player_state = get_player_state_for_idle().ok();
     let sleep_duration = Duration::from_millis(333);
     loop {
-        sleep(sleep_duration).await;
-        if get_player_state_for_idle().ok() != initial_player_state {
+        let current_state = get_player_state_for_idle().ok();
+        if current_state != state.last_idle_state {
             debug!("Handling idle finished with player status change");
+            state.last_idle_state = current_state;
             return Ok(b"changed: player\n".to_vec());
         }
+        let mut buf = [0; 1024];
+        let mut read: Vec<u8> = Vec::new();
+        if let Ok(n) = socket.try_read(&mut buf) {
+            read.append(&mut buf[0..n].to_vec());
+            if let Some(i) = read.iter().position(|&b| b == b'\n' || b == b'\r') {
+                if &read[0..i] == b"noidle" {
+                    debug!("Finish idle early due to noidle command");
+                    return Ok(Vec::new());
+                }
+            }
+        }
+        sleep(sleep_duration).await;
     }
 }
 
