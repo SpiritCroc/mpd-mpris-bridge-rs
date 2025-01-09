@@ -39,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
                 command_list_count: 0,
                 command_list_failed: false,
                 last_idle_state: None,
+                should_close: false,
             };
 
             loop {
@@ -55,13 +56,17 @@ async fn main() -> anyhow::Result<()> {
                         return;
                     }
                 };
+                debug!("Done reading {n} from {addr}");
 
                 // Handle commands
                 if let Err(e) = handle_mpd_queries(&mut socket, &buf[0..n], &mut state).await {
                     warn!("Failed to handle MPD queries: {:?}", e);
                     return;
                 }
-                debug!("Done reading {n} from {addr}");
+                if state.should_close {
+                    // Socket will close automatically when out of scope
+                    return;
+                }
             }
         });
     }
@@ -74,6 +79,7 @@ struct MpdQueryState {
     command_list_count: usize,
     command_list_failed: bool,
     last_idle_state: Option<(mpris::PlaybackStatus, std::collections::HashMap<String, mpris::MetadataValue>)>,
+    should_close: bool,
 }
 
 #[derive(Debug)]
@@ -139,6 +145,9 @@ async fn handle_mpd_queries(socket: &mut TcpStream, commands: &[u8], state: &mut
                         trace!("Respond list_OK");
                         socket.write_all(&b"list_OK\n".to_vec()).await?;
                     }
+                } else if state.should_close {
+                    debug!("Closing the socket per request");
+                    return Ok(());
                 } else {
                     trace!("Respond OK");
                     socket.write_all(&b"OK\n".to_vec()).await?;
@@ -230,7 +239,10 @@ async fn handle_mpd_query(command: &[u8], state: &mut MpdQueryState, socket: &mu
         b"playlistinfo" => handle_dummy("playlistinfo"),
         b"lsinfo" => handle_dummy("lsinfo"),
         b"stats" => handle_dummy("stats"),
-        b"close" => handle_dummy("close"),
+        b"close" => {
+            state.should_close = true;
+            Ok(Vec::new())
+        }
         b"setvol" => handle_dummy("setvol"),
         b"noidle" => handle_dummy("noidle"),
         _ => handle_unknown_command(command)
