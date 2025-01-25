@@ -377,7 +377,7 @@ fn handle_status() -> anyhow::Result<Vec<u8>> {
     if let Ok(elapsed) = player.get_position().map(|d| d.as_secs_f32()) {
         response.append(&mut format!("elapsed: {elapsed}\n").into());
         if let Some(duration) = duration {
-            response.append(&mut format!("time: {elapsed}:{duration}\n").into());
+            response.append(&mut format!("time: {elapsed:.0}:{duration:.0}\n").into());
         }
     };
     if let Some(art_url) = metadata.art_url() {
