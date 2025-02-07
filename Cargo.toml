@@ -2,9 +2,12 @@
 name = "mpd-mpris-bridge"
 version = "0.1.0"
 edition = "2021"
+description = "Expose MPRIS infos and controls to MPD clients"
+authors = ["SpiritCroc <dev@spiritcroc.de>"]
 
 [dependencies]
 anyhow = "1.0.95"
+clap = { version = "4.5.28", features = ["derive", "cargo"] }
 env_logger = "0.11.6"
 log = "0.4.22"
 mpris = "2.0.1"

@@ -2,18 +2,33 @@ use log::{trace, debug, info, warn};
 
 use std::time::Duration;
 
+use clap::Parser;
+
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::sleep;
 
 use mpris::{PlayerFinder, Player};
 
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    #[arg(short, long, default_value_t = 6601)]
+    port: u16,
+    #[arg(short, long, default_value_t = String::from("0.0.0.0"))]
+    bind_address: String,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
-    //TODO config
-    info!("Binding to address...");
-    let listener = TcpListener::bind("0.0.0.0:6601").await?;
+
+    let args = Args::parse();
+
+    let address = format!("{}:{}", args.bind_address, args.port);
+    info!("Binding to address {address}...");
+
+    let listener = TcpListener::bind(address).await?;
     info!("Bound to address, listening...");
 
     loop {
