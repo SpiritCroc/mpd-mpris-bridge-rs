@@ -396,7 +396,7 @@ fn get_player_state_for_idle() -> anyhow::Result<(mpris::PlaybackStatus, std::co
 
 async fn handle_idle(arguments: &[u8], state: &mut MpdQueryState, socket: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
     let arguments = std::str::from_utf8(&arguments)?;
-    if arguments.len() > 0 && !arguments.contains("\"player\"") {
+    if arguments.len() > 0 && !arguments.contains("\"player\"") && !arguments.contains("player") {
         return Err(anyhow::anyhow!("No supported subsystem in {}", arguments));
     }
     debug!("Handling idle... subsystems: {}", arguments);
