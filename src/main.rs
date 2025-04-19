@@ -282,9 +282,9 @@ async fn handle_mpd_query(
             state.should_close = true;
             Ok(Vec::new())
         }
-        b"volume"|
-        b"setvol" => handle_setvol(arguments, shared_state).await,
-        b"getvol" => handle_getvol(shared_state).await,
+        b"volume" => handle_volume(arguments, shared_state),
+        b"setvol" => handle_setvol(arguments, shared_state),
+        b"getvol" => handle_getvol(shared_state),
         b"noidle" => handle_dummy("noidle"),
         _ => handle_unknown_command(command)
     };
@@ -499,16 +499,28 @@ async fn handle_idle(
     }
 }
 
-async fn handle_setvol(arguments: &[u8], shared_state: Arc<MpdSharedState>) -> anyhow::Result<Vec<u8>> {
+fn handle_volume(arguments: &[u8], shared_state: Arc<MpdSharedState>) -> anyhow::Result<Vec<u8>> {
     let arguments = std::str::from_utf8(&arguments)?;
     debug!("Handling volume: {arguments}");
+    let arguments = arguments.replace("\"", "");
+    // Only allow u8 volume changes, but use bigger type for calculation without overflows
+    let volume_change = arguments.parse::<i8>()? as i16;
+    let volume = shared_state.null_volume.load(Ordering::SeqCst) as i16;
+    let volume = (volume + volume_change).min(100).max(0) as u8;
+    shared_state.null_volume.store(volume, Ordering::SeqCst);
+    Ok(Vec::new())
+}
+
+fn handle_setvol(arguments: &[u8], shared_state: Arc<MpdSharedState>) -> anyhow::Result<Vec<u8>> {
+    let arguments = std::str::from_utf8(&arguments)?;
+    debug!("Handling setvol: {arguments}");
     let arguments = arguments.replace("\"", "");
     let volume = arguments.parse::<u8>()?;
     shared_state.null_volume.store(volume, Ordering::SeqCst);
     Ok(Vec::new())
 }
 
-async fn handle_getvol(shared_state: Arc<MpdSharedState>) -> anyhow::Result<Vec<u8>> {
+fn handle_getvol(shared_state: Arc<MpdSharedState>) -> anyhow::Result<Vec<u8>> {
     let volume = shared_state.null_volume.load(Ordering::SeqCst);
     debug!("Handling getvol: {volume}");
     Ok(format!("volume: {volume}\n").into())
