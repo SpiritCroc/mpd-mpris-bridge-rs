@@ -282,6 +282,7 @@ async fn handle_mpd_query(
             state.should_close = true;
             Ok(Vec::new())
         }
+        b"volume"|
         b"setvol" => handle_setvol(arguments, shared_state).await,
         b"getvol" => handle_getvol(shared_state).await,
         b"noidle" => handle_dummy("noidle"),
@@ -320,7 +321,8 @@ fn handle_commands() -> anyhow::Result<Vec<u8>> {
         command: stats\n\
         command: status\n\
         command: stop\n\
-        command: tagtypes\n".into())
+        command: tagtypes\n\
+        command: volume\n".into())
 }
 
 fn handle_tagtypes() -> anyhow::Result<Vec<u8>> {
