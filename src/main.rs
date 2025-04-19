@@ -1,5 +1,8 @@
 use log::{trace, debug, info, warn};
 
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
@@ -31,10 +34,15 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(address).await?;
     info!("Bound to address, listening...");
 
+    let shared_state = Arc::new(MpdSharedState {
+        null_volume: AtomicU8::new(0),
+    });
+
     loop {
         let (mut socket, addr) = listener.accept().await?;
         info!("Connected client {addr}");
 
+        let shared_state_clone = shared_state.clone();
         tokio::spawn(async move {
             let mut buf = [0; 1024];
             if let Err(e) = socket.set_nodelay(true) {
@@ -53,7 +61,8 @@ async fn main() -> anyhow::Result<()> {
                 command_list_ended: false,
                 command_list_count: 0,
                 command_list_failed: false,
-                last_idle_state: None,
+                last_idle_player_state: None,
+                last_idle_mixer_state: None,
                 should_close: false,
             };
 
@@ -74,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
                 debug!("Done reading {n} from {addr}");
 
                 // Handle commands
-                if let Err(e) = handle_mpd_queries(&mut socket, &buf[0..n], &mut state).await {
+                if let Err(e) = handle_mpd_queries(&mut socket, &buf[0..n], &mut state, shared_state_clone.clone()).await {
                     warn!("Failed to handle MPD queries: {:?}", e);
                     return;
                 }
@@ -93,8 +102,13 @@ struct MpdQueryState {
     command_list_ended: bool,
     command_list_count: usize,
     command_list_failed: bool,
-    last_idle_state: Option<(mpris::PlaybackStatus, std::collections::HashMap<String, mpris::MetadataValue>)>,
+    last_idle_player_state: Option<(mpris::PlaybackStatus, std::collections::HashMap<String, mpris::MetadataValue>)>,
+    last_idle_mixer_state: Option<u8>,
     should_close: bool,
+}
+
+struct MpdSharedState {
+    null_volume: AtomicU8,
 }
 
 #[derive(Debug)]
@@ -132,7 +146,12 @@ impl MpdCommandError {
     }
 }
 
-async fn handle_mpd_queries(socket: &mut TcpStream, commands: &[u8], state: &mut MpdQueryState) -> anyhow::Result<()> {
+async fn handle_mpd_queries(
+    socket: &mut TcpStream,
+    commands: &[u8],
+    state: &mut MpdQueryState,
+    shared_state: Arc<MpdSharedState>,
+) -> anyhow::Result<()> {
     let mut remainder = commands.to_vec();
     loop {
         if remainder.is_empty() {
@@ -149,7 +168,7 @@ async fn handle_mpd_queries(socket: &mut TcpStream, commands: &[u8], state: &mut
         if remainder.is_empty() {
             continue;
         }
-        match handle_mpd_query(&remainder, state, socket).await {
+        match handle_mpd_query(&remainder, state, shared_state.clone(), socket).await {
             Ok(response) => {
                 if response.len() > 0 {
                     trace!("Respond {}", safe_command_print(&response));
@@ -189,7 +208,12 @@ async fn handle_mpd_queries(socket: &mut TcpStream, commands: &[u8], state: &mut
 }
 
 /// Execute a query and returns the response to send back
-async fn handle_mpd_query(command: &[u8], state: &mut MpdQueryState, socket: &mut TcpStream) -> Result<Vec<u8>, MpdCommandError> {
+async fn handle_mpd_query(
+    command: &[u8],
+    state: &mut MpdQueryState,
+    shared_state: Arc<MpdSharedState>,
+    socket: &mut TcpStream
+) -> Result<Vec<u8>, MpdCommandError> {
     let (command, arguments) = match command.iter().position(|&b| b == b' ') {
         Some(i) => (&command[0..i], &command[i+1..command.len()]),
         None => (command, &[] as &[u8])
@@ -231,8 +255,8 @@ async fn handle_mpd_query(command: &[u8], state: &mut MpdQueryState, socket: &mu
         b"previous" => handle_previous(),
         // Infos
         b"currentsong" => handle_current_song(),
-        b"status" => handle_status(),
-        b"idle" => handle_idle(arguments, state, socket).await,
+        b"status" => handle_status(shared_state),
+        b"idle" => handle_idle(arguments, state, shared_state, socket).await,
         // Aggregating commands
         b"command_list_begin" => {
             debug!("Received command_list_begin");
@@ -258,7 +282,8 @@ async fn handle_mpd_query(command: &[u8], state: &mut MpdQueryState, socket: &mu
             state.should_close = true;
             Ok(Vec::new())
         }
-        b"setvol" => handle_dummy("setvol"),
+        b"setvol" => handle_setvol(arguments, shared_state).await,
+        b"getvol" => handle_getvol(shared_state).await,
         b"noidle" => handle_dummy("noidle"),
         _ => handle_unknown_command(command)
     };
@@ -282,6 +307,7 @@ fn handle_commands() -> anyhow::Result<Vec<u8>> {
     Ok("command: close\n\
         command: commands\n\
         command: currentsong\n\
+        command: getvol\n\
         command: idle\n\
         command: lsinfo\n\
         command: next\n\
@@ -290,6 +316,7 @@ fn handle_commands() -> anyhow::Result<Vec<u8>> {
         command: play\n\
         command: playlistinfo\n\
         command: previous\n\
+        command: setvol\n\
         command: stats\n\
         command: status\n\
         command: stop\n\
@@ -354,26 +381,39 @@ fn handle_current_song() -> anyhow::Result<Vec<u8>> {
     if let Some(art_url) = metadata.art_url() {
         response.append(&mut format!("arturl: {art_url}\n").into());
     };
-    debug!("Handled current song");
+    debug!("Handled current song with metadata {:?}", metadata);
     Ok(response.into())
 }
 
-fn handle_status() -> anyhow::Result<Vec<u8>> {
+fn handle_dummy_status(volume: u8) -> Vec<u8> {
+    format!("repeat: 0\n\
+             random: 0\n\
+             song: 0\n\
+             playlistlength: 0\n\
+             volume: {volume}\n\
+             state: stop\n").into()
+}
+
+fn handle_status(shared_state: Arc<MpdSharedState>) -> anyhow::Result<Vec<u8>> {
+    let volume = shared_state.null_volume.load(Ordering::SeqCst);
     let Ok(player) = get_mpris_player() else {
-        info!("Handled status without player");
-        return Ok("repeat: 0\n\
-                   random: 0\n\
-                   song: 0\n\
-                   playlistlength: 0\n\
-                   state: stop\n".into());
+        info!("Handled status without player, volume: {volume}");
+        return Ok(handle_dummy_status(volume));
     };
-    let metadata = player.get_metadata()?;
+    let Ok(metadata) = player.get_metadata() else {
+        warn!("Handled status without metadata: {volume}");
+        return Ok(handle_dummy_status(volume));
+    };
 
     // https://mpd.readthedocs.io/en/latest/protocol.html
-    let state = match player.get_playback_status()? {
-        mpris::PlaybackStatus::Playing => "play",
-        mpris::PlaybackStatus::Paused => "pause",
-        mpris::PlaybackStatus::Stopped => "stop"
+    let state = match player.get_playback_status() {
+        Ok(mpris::PlaybackStatus::Playing) => "play",
+        Ok(mpris::PlaybackStatus::Paused) => "pause",
+        Ok(mpris::PlaybackStatus::Stopped) => "stop",
+        Err(e) => {
+            warn!("Handled status without playback status: {e}; volume: {volume}");
+            return Ok(handle_dummy_status(volume));
+        }
     };
 
     let response: &mut Vec<u8> =
@@ -382,6 +422,7 @@ fn handle_status() -> anyhow::Result<Vec<u8>> {
              random: 0\n\
              song: 0\n\
              playlistlength: 1\n\
+             volume: {volume}\n\
              state: {state}\n"
         ).into();
 
@@ -398,7 +439,7 @@ fn handle_status() -> anyhow::Result<Vec<u8>> {
     if let Some(art_url) = metadata.art_url() {
         response.append(&mut format!("arturl: {art_url}\n").into());
     };
-    debug!("Handled status: {state}");
+    debug!("Handled status: {state}, volume {volume}");
     Ok(response.to_vec())
 }
 
@@ -409,19 +450,37 @@ fn get_player_state_for_idle() -> anyhow::Result<(mpris::PlaybackStatus, std::co
     Ok((status, metadata))
 }
 
-async fn handle_idle(arguments: &[u8], state: &mut MpdQueryState, socket: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
+async fn handle_idle(
+    arguments: &[u8],
+    state: &mut MpdQueryState,
+    shared_state: Arc<MpdSharedState>,
+    socket: &mut TcpStream
+) -> anyhow::Result<Vec<u8>> {
     let arguments = std::str::from_utf8(&arguments)?;
-    if arguments.len() > 0 && !arguments.contains("\"player\"") && !arguments.contains("player") {
+    let idle_all = arguments.len() == 0;
+    let idle_player = idle_all || arguments.contains("\"player\"") || arguments.contains("player");
+    let idle_mixer = idle_all || arguments.contains("\"mixer\"") || arguments.contains("mixer");
+    if !idle_player && !idle_mixer {
         return Err(anyhow::anyhow!("No supported subsystem in {}", arguments));
     }
     debug!("Handling idle... subsystems: {}", arguments);
     let sleep_duration = Duration::from_millis(333);
     loop {
-        let current_state = get_player_state_for_idle().ok();
-        if current_state != state.last_idle_state {
-            debug!("Handling idle finished with player status change");
-            state.last_idle_state = current_state;
-            return Ok(b"changed: player\n".to_vec());
+        if idle_player {
+            let current_state = get_player_state_for_idle().ok();
+            if current_state != state.last_idle_player_state {
+                debug!("Handling idle finished with player status change");
+                state.last_idle_player_state = current_state;
+                return Ok(b"changed: player\n".to_vec());
+            }
+        }
+        if idle_mixer {
+            let current_volume = Some(shared_state.null_volume.load(Ordering::SeqCst));
+            if current_volume != state.last_idle_mixer_state {
+                debug!("Handling idle finished with mixer status change");
+                state.last_idle_mixer_state = current_volume;
+                return Ok(b"changed: mixer\n".to_vec());
+            }
         }
         let mut buf = [0; 1024];
         let mut read: Vec<u8> = Vec::new();
@@ -436,6 +495,21 @@ async fn handle_idle(arguments: &[u8], state: &mut MpdQueryState, socket: &mut T
         }
         sleep(sleep_duration).await;
     }
+}
+
+async fn handle_setvol(arguments: &[u8], shared_state: Arc<MpdSharedState>) -> anyhow::Result<Vec<u8>> {
+    let arguments = std::str::from_utf8(&arguments)?;
+    debug!("Handling volume: {arguments}");
+    let arguments = arguments.replace("\"", "");
+    let volume = arguments.parse::<u8>()?;
+    shared_state.null_volume.store(volume, Ordering::SeqCst);
+    Ok(Vec::new())
+}
+
+async fn handle_getvol(shared_state: Arc<MpdSharedState>) -> anyhow::Result<Vec<u8>> {
+    let volume = shared_state.null_volume.load(Ordering::SeqCst);
+    debug!("Handling getvol: {volume}");
+    Ok(format!("volume: {volume}\n").into())
 }
 
 fn handle_unknown_command(command: &[u8]) -> anyhow::Result<Vec<u8>> {
