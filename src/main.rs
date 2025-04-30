@@ -1,15 +1,16 @@
-use log::{trace, debug, info, warn};
+use log::{trace, debug, info, warn, error};
 
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use clap::Parser;
 
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::sleep;
+use tokio::sync::mpsc;
+use tokio::time::{sleep, timeout};
 
 use mpris::{PlayerFinder, Player};
 
@@ -22,19 +23,40 @@ struct Args {
     bind_address: String,
 }
 
+#[derive(Debug)]
+enum Command {
+    Play,
+    Pause,
+    Stop,
+    Next,
+    Prev,
+}
+
 struct MpdQueryState {
+    command_tx: mpsc::Sender<Command>,
     in_command_list: bool,
     in_command_list_ok: bool,
     command_list_ended: bool,
     command_list_count: usize,
     command_list_failed: bool,
-    last_idle_player_state: Option<(mpris::PlaybackStatus, std::collections::HashMap<String, mpris::MetadataValue>)>,
+    last_idle_player_state: Option<PlayerState>,
     last_idle_mixer_state: Option<u8>,
     should_close: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct PlayerState {
+    playback_status: mpris::PlaybackStatus,
+    title: Option<String>,
+    artist: Option<String>,
+    duration: Option<f32>,
+    elapsed: Option<f32>,
+    art_url: Option<String>,
+}
+
 struct MpdSharedState {
     null_volume: AtomicU8,
+    player_state: Arc<RwLock<Option<PlayerState>>>,
 }
 
 #[derive(Debug)]
@@ -84,65 +106,192 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(address).await?;
     info!("Bound to address, listening...");
 
+    // TODO some signaling for idle in the other way round as well
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let player_state = Arc::new(RwLock::new(None));
+
     let shared_state = Arc::new(MpdSharedState {
+        player_state: player_state.clone(),
         null_volume: AtomicU8::new(0),
     });
 
-    loop {
-        let (mut socket, addr) = listener.accept().await?;
-        info!("Connected client {addr}");
+    // Accept incoming MPD clients
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, addr) = listener.accept().await.unwrap();
+            info!("Connected client {addr}");
 
-        let shared_state_clone = shared_state.clone();
-        tokio::spawn(async move {
-            let mut buf = [0; 1024];
-            if let Err(e) = socket.set_nodelay(true) {
-                warn!("Failed to set nodelay: {:?}", e);
-            }
+            let shared_state = shared_state.clone();
+            let command_tx = command_tx.clone();
+            tokio::spawn(async move {
+                let mut buf = [0; 1024];
+                if let Err(e) = socket.set_nodelay(true) {
+                    warn!("Failed to set nodelay: {:?}", e);
 
-            // Send initial greeting
-            if let Err(e) = socket.write_all(b"OK MPD 0.23.16\n").await {
-                warn!("Failed to write to socket; err = {:?}", e);
-                return;
-            }
+                }
 
-            let mut state = MpdQueryState {
-                in_command_list: false,
-                in_command_list_ok: false,
-                command_list_ended: false,
-                command_list_count: 0,
-                command_list_failed: false,
-                last_idle_player_state: None,
-                last_idle_mixer_state: None,
-                should_close: false,
-            };
+                // Send initial greeting
+                if let Err(e) = socket.write_all(b"OK MPD 0.23.16\n").await {
+                    warn!("Failed to write to socket; err = {:?}", e);
+                    return;
+                }
 
-            loop {
-                debug!("Reading from {addr}...");
-                let n = match socket.read(&mut buf).await {
-                    // socket closed
-                    Ok(0) => {
-                        debug!("Socket closed: {addr}");
-                        return
-                    }
-                    Ok(n) => n,
-                    Err(e) => {
-                        warn!("Failed to read from socket; err = {:?}", e);
+                let mut state = MpdQueryState {
+                    command_tx: command_tx,
+                    in_command_list: false,
+                    in_command_list_ok: false,
+                    command_list_ended: false,
+                    command_list_count: 0,
+                    command_list_failed: false,
+                    last_idle_player_state: None,
+                    last_idle_mixer_state: None,
+                    should_close: false,
+                };
+
+                loop {
+                    trace!("Reading from {addr}...");
+                    let n = match socket.read(&mut buf).await {
+                        // socket closed
+                        Ok(0) => {
+                            debug!("Socket closed: {addr}");
+                            return
+                        }
+                        Ok(n) => n,
+                        Err(e) => {
+                            warn!("Failed to read from socket; err = {:?}", e);
+                            return;
+                        }
+                    };
+                    trace!("Done reading {n} from {addr}");
+
+                    // Handle commands
+                    if let Err(e) = handle_mpd_queries(&mut socket, &buf[0..n], &mut state, shared_state.clone()).await {
+                        warn!("Failed to handle MPD queries: {:?}", e);
                         return;
                     }
-                };
-                debug!("Done reading {n} from {addr}");
-
-                // Handle commands
-                if let Err(e) = handle_mpd_queries(&mut socket, &buf[0..n], &mut state, shared_state_clone.clone()).await {
-                    warn!("Failed to handle MPD queries: {:?}", e);
-                    return;
+                    if state.should_close {
+                        // Socket will close automatically when out of scope
+                        return;
+                    }
                 }
-                if state.should_close {
-                    // Socket will close automatically when out of scope
-                    return;
+            });
+        }
+    });
+
+    // Observe and control local MPRIS player
+    observe_mpris(command_rx, player_state).await;
+
+    Ok(())
+}
+
+fn try_set_player_state(
+    player_state: &Arc<RwLock<Option<PlayerState>>>,
+    value: Option<PlayerState>,
+    last_emitted_value: &mut Option<PlayerState>,
+) {
+    // Keep track locally of last set value to avoid retrieving the write lock if not necessary
+    if *last_emitted_value == value {
+        return
+    }
+    match player_state.write() {
+        Ok(mut guard) => {
+            *guard = value.clone();
+            *last_emitted_value = value;
+            trace!("Player state updated");
+        }
+        Err(_) => error!("Failed to write player state"),
+    }
+}
+
+async fn observe_mpris(mut command_rx: mpsc::Receiver<Command>, player_state: Arc<RwLock<Option<PlayerState>>>) {
+    let fail_delay = Duration::from_millis(1500);
+    let poll_delay = Duration::from_millis(1000);
+    let mut last_connect_err = None;
+    let mut last_emitted_player_state = None;
+    loop {
+        try_set_player_state(&player_state, None, &mut last_emitted_player_state);
+        let mut player = match find_mpris_player() {
+            Ok(player) => player,
+            Err(e) => {
+                let connect_err = Some(format!("{e}"));
+                if last_connect_err != connect_err {
+                    warn!("Cannot select MPRIS player. {}", e);
+                }
+                last_connect_err = connect_err;
+                sleep(fail_delay).await;
+                continue;
+            }
+        };
+        info!("Connected to MPRIS player. {:?}", player);
+        last_connect_err = None;
+        loop {
+            match timeout(poll_delay, command_rx.recv()).await {
+                Ok(Some(command)) => {
+                    debug!("Handle command {command:?}");
+                    match command {
+                        Command::Play => {
+                            if let Err(e) = player.play() {
+                                error!("Failed to execute command {command:?}: {e}");
+                            }
+                        },
+                        Command::Pause => {
+                            if let Err(e) = player.pause() {
+                                error!("Failed to execute command {command:?}: {e}");
+                            }
+                        },
+                        Command::Stop => {
+                            if let Err(e) = player.stop() {
+                                error!("Failed to execute command {command:?}: {e}");
+                            }
+                        },
+                        Command::Next => {
+                            if let Err(e) = player.next() {
+                                error!("Failed to execute command {command:?}: {e}");
+                            }
+                        },
+                        Command::Prev => {
+                            if let Err(e) = player.previous() {
+                                error!("Failed to execute command {command:?}: {e}");
+                            }
+                        },
+                    }
+                }
+                Ok(None) => warn!("Command channel closed"),
+                Err(_) => trace!("Polling"),
+            }
+            let playback_status = match player.get_playback_status() {
+                Ok(status) => status,
+                Err(e) => {
+                    warn!("Failed to read playback status, {}", e);
+                    break;
+                }
+            };
+            let metadata = match player.get_metadata() {
+                Ok(metadata) => metadata,
+                Err(e) => {
+                    warn!("Failed to read metadata, {}", e);
+                    break;
+                }
+            };
+            let state = PlayerState {
+                playback_status,
+                title: metadata.title().map(|t| t.into()),
+                artist: metadata.artists().map(|a| a.join(", ")),
+                duration: metadata.length().map(|d| d.as_secs_f32()),
+                elapsed: player.get_position().map(|d| d.as_secs_f32()).ok(),
+                art_url: metadata.art_url().map(|u| u.into()),
+            };
+            try_set_player_state(&player_state, Some(state), &mut last_emitted_player_state);
+            // If this player is not playing, need to check if another is
+            if playback_status != mpris::PlaybackStatus::Playing {
+                if let Ok(new_player) = find_mpris_player() {
+                    if new_player.unique_name() != player.unique_name() {
+                        info!("Switching active player to {new_player:?}");
+                        player = new_player;
+                    }
                 }
             }
-        });
+        };
     }
 }
 
@@ -229,32 +378,32 @@ async fn handle_mpd_query(
         b"commands" => handle_commands(),
         b"tagtypes" => handle_tagtypes(),
         // Playback
-        b"play" => handle_play(),
+        b"play" => handle_play(state).await,
         b"pause" => {
             match arguments {
-                b"1" => handle_pause(),
-                b"\"1\"" => handle_pause(),
-                b"" => handle_pause(),
+                b"1" => handle_pause(state).await,
+                b"\"1\"" => handle_pause(state).await,
+                b"" => handle_pause(state).await,
                 _ => {
                     debug!("Pause command with arguments {} mapped to play", safe_command_print(arguments));
-                    handle_play()
+                    handle_play(state).await
                 }
             }
         }
         b"stop" => {
             // Some clients don't properly support stop, in which case pause is good enough
-            match handle_stop() {
+            match handle_stop(state).await {
                 Err(e) => {
                     warn!("Handling stop failed, try with pause instead: {:?}", e);
-                    handle_pause()
+                    handle_pause(state).await
                 }
                 v => v
             }
         }
-        b"next" => handle_next(),
-        b"previous" => handle_previous(),
+        b"next" => handle_next(state).await,
+        b"previous" => handle_previous(state).await,
         // Infos
-        b"currentsong" => handle_current_song(),
+        b"currentsong" => handle_current_song(shared_state),
         b"status" => handle_status(shared_state),
         b"idle" => handle_idle(arguments, state, shared_state, socket).await,
         // Aggregating commands
@@ -293,7 +442,7 @@ async fn handle_mpd_query(
     )
 }
 
-fn get_mpris_player() -> anyhow::Result<Player> {
+fn find_mpris_player() -> anyhow::Result<Player> {
     let player = PlayerFinder::new()?.find_active()?;
     Ok(player)
 }
@@ -333,57 +482,60 @@ fn handle_tagtypes() -> anyhow::Result<Vec<u8>> {
 }
 
 
-fn handle_play() -> anyhow::Result<Vec<u8>> {
-    get_mpris_player()?.play()?;
-    debug!("Handled play action");
+async fn handle_play(state: &mut MpdQueryState) -> anyhow::Result<Vec<u8>> {
+    state.command_tx.send(Command::Play).await?;
+    debug!("Ack play action");
     Ok(Vec::new())
 }
 
-fn handle_pause() -> anyhow::Result<Vec<u8>> {
-    get_mpris_player()?.pause()?;
-    debug!("Handled pause action");
+async fn handle_pause(state: &mut MpdQueryState) -> anyhow::Result<Vec<u8>> {
+    state.command_tx.send(Command::Pause).await?;
+    debug!("Ack pause action");
     Ok(Vec::new())
 }
 
-fn handle_stop() -> anyhow::Result<Vec<u8>> {
-    get_mpris_player()?.stop()?;
-    debug!("Handled stop action");
+async fn handle_stop(state: &mut MpdQueryState) -> anyhow::Result<Vec<u8>> {
+    state.command_tx.send(Command::Stop).await?;
+    debug!("Ack stop action");
     Ok(Vec::new())
 }
 
-fn handle_next() -> anyhow::Result<Vec<u8>> {
-    get_mpris_player()?.next()?;
-    debug!("Handled next action");
+async fn handle_next(state: &mut MpdQueryState) -> anyhow::Result<Vec<u8>> {
+    state.command_tx.send(Command::Next).await?;
+    debug!("Ack next action");
     Ok(Vec::new())
 }
 
-fn handle_previous() -> anyhow::Result<Vec<u8>> {
-    get_mpris_player()?.previous()?;
-    debug!("Handled previous action");
+async fn handle_previous(state: &mut MpdQueryState) -> anyhow::Result<Vec<u8>> {
+    state.command_tx.send(Command::Prev).await?;
+    debug!("Ack prev action");
     Ok(Vec::new())
 }
 
-fn handle_current_song() -> anyhow::Result<Vec<u8>> {
-    let Ok(player) = get_mpris_player() else {
+fn handle_current_song(shared_state: Arc<MpdSharedState>) -> anyhow::Result<Vec<u8>> {
+    let Ok(player_state) = shared_state.player_state.read() else {
+        error!("Failed to read player state for current song");
+        return Ok(Vec::new());
+    };
+    let Some(ref player_state) = *player_state else {
         info!("Handled current song without player");
         return Ok(Vec::new());
     };
-    let metadata = player.get_metadata()?;
     let mut response: Vec<u8> = Vec::new();
 
-    if let Some(title) = metadata.title() {
+    if let Some(title) = &player_state.title {
         response.append(&mut format!("file: {title}\nTitle: {title}\n").into());
     };
-    if let Some(artist) = metadata.artists().map(|a| a.join(", ")) {
+    if let Some(artist) = &player_state.artist {
         response.append(&mut format!("Artist: {artist}\n").into());
     };
-    if let Some(duration) = metadata.length().map(|d| d.as_secs_f32()) {
+    if let Some(duration) = &player_state.duration {
         response.append(&mut format!("Time: {duration}\nduration: {duration:.3}\n").into());
     };
-    if let Some(art_url) = metadata.art_url() {
+    if let Some(art_url) = &player_state.art_url {
         response.append(&mut format!("arturl: {art_url}\n").into());
     };
-    debug!("Handled current song with metadata {:?}", metadata);
+    debug!("Handled current song with player state {:?}", player_state);
     Ok(response.into())
 }
 
@@ -398,24 +550,20 @@ fn handle_dummy_status(volume: u8) -> Vec<u8> {
 
 fn handle_status(shared_state: Arc<MpdSharedState>) -> anyhow::Result<Vec<u8>> {
     let volume = shared_state.null_volume.load(Ordering::SeqCst);
-    let Ok(player) = get_mpris_player() else {
-        info!("Handled status without player, volume: {volume}");
+    let Ok(player_state) = shared_state.player_state.read() else {
+        error!("Failed to read player state for status");
         return Ok(handle_dummy_status(volume));
     };
-    let Ok(metadata) = player.get_metadata() else {
-        warn!("Handled status without metadata: {volume}");
+    let Some(ref player_state) = *player_state else {
+        info!("Handled status without player");
         return Ok(handle_dummy_status(volume));
     };
 
     // https://mpd.readthedocs.io/en/latest/protocol.html
-    let state = match player.get_playback_status() {
-        Ok(mpris::PlaybackStatus::Playing) => "play",
-        Ok(mpris::PlaybackStatus::Paused) => "pause",
-        Ok(mpris::PlaybackStatus::Stopped) => "stop",
-        Err(e) => {
-            warn!("Handled status without playback status: {e}; volume: {volume}");
-            return Ok(handle_dummy_status(volume));
-        }
+    let state = match player_state.playback_status {
+        mpris::PlaybackStatus::Playing => "play",
+        mpris::PlaybackStatus::Paused => "pause",
+        mpris::PlaybackStatus::Stopped => "stop",
     };
 
     let response: &mut Vec<u8> =
@@ -428,28 +576,32 @@ fn handle_status(shared_state: Arc<MpdSharedState>) -> anyhow::Result<Vec<u8>> {
              state: {state}\n"
         ).into();
 
-    let duration = metadata.length().map(|d| d.as_secs_f32());
-    if let Some(duration) = duration {
+    if let Some(duration) = player_state.duration {
         response.append(&mut format!("duration: {duration}\n").into());
     };
-    if let Ok(elapsed) = player.get_position().map(|d| d.as_secs_f32()) {
+    if let Some(elapsed) = player_state.elapsed {
         response.append(&mut format!("elapsed: {elapsed}\n").into());
-        if let Some(duration) = duration {
+        if let Some(duration) = player_state.duration {
             response.append(&mut format!("time: {elapsed:.0}:{duration:.0}\n").into());
         }
     };
-    if let Some(art_url) = metadata.art_url() {
+    if let Some(art_url) = &player_state.art_url {
         response.append(&mut format!("arturl: {art_url}\n").into());
     };
     debug!("Handled status: {state}, volume {volume}");
     Ok(response.to_vec())
 }
 
-fn get_player_state_for_idle() -> anyhow::Result<(mpris::PlaybackStatus, std::collections::HashMap<String, mpris::MetadataValue>)> {
-    let player = get_mpris_player()?;
-    let status = player.get_playback_status()?;
-    let metadata: std::collections::HashMap<_, _> = player.get_metadata()?.into();
-    Ok((status, metadata))
+fn get_player_state_for_idle(player_state: &PlayerState) -> PlayerState {
+    // Just a subset of values interesting for the idle command
+    PlayerState {
+        playback_status: player_state.playback_status,
+        title: player_state.title.clone(),
+        artist: player_state.artist.clone(),
+        duration: None,
+        elapsed: None,
+        art_url: player_state.art_url.clone(),
+    }
 }
 
 async fn handle_idle(
@@ -469,9 +621,14 @@ async fn handle_idle(
     let sleep_duration = Duration::from_millis(333);
     loop {
         if idle_player {
-            let current_state = get_player_state_for_idle().ok();
+            let current_state = shared_state.player_state
+                .read()
+                .ok()
+                .map(|inner|
+                    inner.clone().map(|state| get_player_state_for_idle(&state))
+                ).flatten();
             if current_state != state.last_idle_player_state {
-                debug!("Handling idle finished with player status change");
+                info!("Handling idle finished with player status change");
                 state.last_idle_player_state = current_state;
                 return Ok(b"changed: player\n".to_vec());
             }
@@ -486,16 +643,22 @@ async fn handle_idle(
         }
         let mut buf = [0; 1024];
         let mut read: Vec<u8> = Vec::new();
-        if let Ok(n) = socket.try_read(&mut buf) {
-            read.append(&mut buf[0..n].to_vec());
-            if let Some(i) = read.iter().position(|&b| b == b'\n' || b == b'\r') {
-                if &read[0..i] == b"noidle" {
-                    debug!("Finish idle early due to noidle command");
-                    return Ok(Vec::new());
+        match timeout(sleep_duration, socket.read(&mut buf)).await {
+            Ok(Ok(n)) => {
+                read.append(&mut buf[0..n].to_vec());
+                if let Some(i) = read.iter().position(|&b| b == b'\n' || b == b'\r') {
+                    if &read[0..i] == b"noidle" {
+                        debug!("Finish idle early due to noidle command");
+                        return Ok(Vec::new());
+                    }
                 }
             }
+            Ok(Err(e)) => {
+                error!("Failed to read while idling: {e}");
+                return Err(e.into());
+            }
+            Err(_) => {} // Just a timeout for idle state polling
         }
-        sleep(sleep_duration).await;
     }
 }
 
