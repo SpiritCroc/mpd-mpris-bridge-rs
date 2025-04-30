@@ -22,6 +22,56 @@ struct Args {
     bind_address: String,
 }
 
+struct MpdQueryState {
+    in_command_list: bool,
+    in_command_list_ok: bool,
+    command_list_ended: bool,
+    command_list_count: usize,
+    command_list_failed: bool,
+    last_idle_player_state: Option<(mpris::PlaybackStatus, std::collections::HashMap<String, mpris::MetadataValue>)>,
+    last_idle_mixer_state: Option<u8>,
+    should_close: bool,
+}
+
+struct MpdSharedState {
+    null_volume: AtomicU8,
+}
+
+#[derive(Debug)]
+struct MpdCommandError {
+    //command: Vec<u8>,
+    command_str: String,
+    message: String,
+    mpd_error_code: i8,
+}
+impl std::error::Error for MpdCommandError {}
+impl std::fmt::Display for MpdCommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "Command {} failed: {}", self.command_str, self.message)
+    }
+}
+
+fn safe_command_print(command: &[u8]) -> &str {
+    match std::str::from_utf8(&command) {
+        Ok(s) => s,
+        Err(_) => "[un-utf8 command]"
+    }
+}
+
+impl MpdCommandError {
+    pub fn new(command: &[u8], message: &str) -> MpdCommandError {
+        let command_str = safe_command_print(&command);
+        MpdCommandError {
+            //command: command.to_vec(),
+            command_str: command_str.to_string(),
+            message: message.to_string(),
+            // Error codes: https://github.com/MusicPlayerDaemon/MPD/blob/master/src/protocol/Ack.hxx
+            // 5 is unknown
+            mpd_error_code: 5,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
@@ -93,56 +143,6 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         });
-    }
-}
-
-struct MpdQueryState {
-    in_command_list: bool,
-    in_command_list_ok: bool,
-    command_list_ended: bool,
-    command_list_count: usize,
-    command_list_failed: bool,
-    last_idle_player_state: Option<(mpris::PlaybackStatus, std::collections::HashMap<String, mpris::MetadataValue>)>,
-    last_idle_mixer_state: Option<u8>,
-    should_close: bool,
-}
-
-struct MpdSharedState {
-    null_volume: AtomicU8,
-}
-
-#[derive(Debug)]
-struct MpdCommandError {
-    //command: Vec<u8>,
-    command_str: String,
-    message: String,
-    mpd_error_code: i8,
-}
-impl std::error::Error for MpdCommandError {}
-impl std::fmt::Display for MpdCommandError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "Command {} failed: {}", self.command_str, self.message)
-    }
-}
-
-fn safe_command_print(command: &[u8]) -> &str {
-    match std::str::from_utf8(&command) {
-        Ok(s) => s,
-        Err(_) => "[un-utf8 command]"
-    }
-}
-
-impl MpdCommandError {
-    pub fn new(command: &[u8], message: &str) -> MpdCommandError {
-        let command_str = safe_command_print(&command);
-        MpdCommandError {
-            //command: command.to_vec(),
-            command_str: command_str.to_string(),
-            message: message.to_string(),
-            // Error codes: https://github.com/MusicPlayerDaemon/MPD/blob/master/src/protocol/Ack.hxx
-            // 5 is unknown
-            mpd_error_code: 5,
-        }
     }
 }
 
