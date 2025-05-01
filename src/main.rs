@@ -40,6 +40,7 @@ struct MpdQueryState {
     command_list_count: usize,
     command_list_failed: bool,
     last_idle_player_state: Option<PlayerState>,
+    last_idle_playlist_state: Option<PlayerState>,
     last_idle_mixer_state: Option<u8>,
     should_close: bool,
 }
@@ -144,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
                     command_list_count: 0,
                     command_list_failed: false,
                     last_idle_player_state: None,
+                    last_idle_playlist_state: None,
                     last_idle_mixer_state: None,
                     should_close: false,
                 };
@@ -592,7 +594,7 @@ fn handle_status(shared_state: Arc<MpdSharedState>) -> anyhow::Result<Vec<u8>> {
     Ok(response.to_vec())
 }
 
-fn get_player_state_for_idle(player_state: &PlayerState) -> PlayerState {
+fn get_state_for_idle_player(player_state: &PlayerState) -> PlayerState {
     // Just a subset of values interesting for the idle command
     PlayerState {
         playback_status: player_state.playback_status,
@@ -601,6 +603,18 @@ fn get_player_state_for_idle(player_state: &PlayerState) -> PlayerState {
         duration: None,
         elapsed: None,
         art_url: player_state.art_url.clone(),
+    }
+}
+
+fn get_state_for_idle_playlist(player_state: &PlayerState) -> PlayerState {
+    // Just a subset of values interesting for the idle command
+    PlayerState {
+        playback_status: mpris::PlaybackStatus::Paused,
+        title: player_state.title.clone(),
+        artist: player_state.artist.clone(),
+        duration: None,
+        elapsed: None,
+        art_url: None,
     }
 }
 
@@ -613,24 +627,35 @@ async fn handle_idle(
     let arguments = std::str::from_utf8(&arguments)?;
     let idle_all = arguments.len() == 0;
     let idle_player = idle_all || arguments.contains("\"player\"") || arguments.contains("player");
+    let idle_playlist = idle_all || arguments.contains("\"playlist\"") || arguments.contains("playlist");
     let idle_mixer = idle_all || arguments.contains("\"mixer\"") || arguments.contains("mixer");
-    if !idle_player && !idle_mixer {
+    if !idle_player && !idle_mixer && !idle_playlist {
         return Err(anyhow::anyhow!("No supported subsystem in {}", arguments));
     }
     debug!("Handling idle... subsystems: {}", arguments);
     let sleep_duration = Duration::from_millis(333);
     loop {
-        if idle_player {
-            let current_state = shared_state.player_state
+        if idle_player || idle_playlist {
+            let current_raw_state = shared_state.player_state
                 .read()
                 .ok()
-                .map(|inner|
-                    inner.clone().map(|state| get_player_state_for_idle(&state))
-                ).flatten();
-            if current_state != state.last_idle_player_state {
-                info!("Handling idle finished with player status change");
-                state.last_idle_player_state = current_state;
-                return Ok(b"changed: player\n".to_vec());
+                .map(|inner| inner.clone())
+                .flatten();
+            if idle_player {
+                let current_state = current_raw_state.as_ref().map(|state| get_state_for_idle_player(state));
+                if current_state != state.last_idle_player_state {
+                    info!("Handling idle finished with player status change");
+                    state.last_idle_player_state = current_state;
+                    return Ok(b"changed: player\n".to_vec());
+                }
+            }
+            if idle_playlist {
+                let current_state = current_raw_state.as_ref().map(|state| get_state_for_idle_playlist(state));
+                if current_state != state.last_idle_playlist_state {
+                    info!("Handling idle finished with playlist status change");
+                    state.last_idle_playlist_state = current_state;
+                    return Ok(b"changed: playlist\n".to_vec());
+                }
             }
         }
         if idle_mixer {
