@@ -218,6 +218,8 @@ async fn observe_mpris(mut command_rx: mpsc::Receiver<Command>, player_state: Ar
                 let connect_err = Some(format!("{e}"));
                 if last_connect_err != connect_err {
                     warn!("Cannot select MPRIS player. {}", e);
+                } else {
+                    trace!("Still cannot select MPRIS player. {}", e);
                 }
                 last_connect_err = connect_err;
                 sleep(fail_delay).await;
