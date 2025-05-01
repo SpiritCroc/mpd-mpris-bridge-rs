@@ -310,7 +310,7 @@ async fn handle_mpd_queries(
         if remainder.is_empty() {
             break;
         }
-        if remainder[0] == b'\n' {
+        if remainder[0] == b'\n' || remainder[0] == b'\r' {
             remainder.remove(0);
             continue;
         }
@@ -319,7 +319,7 @@ async fn handle_mpd_queries(
             None => remainder.clone()
         };
         if remainder.is_empty() {
-            continue;
+            break;
         }
         match handle_mpd_query(&remainder, state, shared_state.clone(), socket).await {
             Ok(response) => {
@@ -671,6 +671,11 @@ async fn handle_idle(
         let mut buf = [0; 1024];
         let mut read: Vec<u8> = Vec::new();
         match timeout(sleep_duration, socket.read(&mut buf)).await {
+            Ok(Ok(0)) => {
+                debug!("Socket closed from idle");
+                state.should_close = true;
+                return Ok(Vec::new());
+            }
             Ok(Ok(n)) => {
                 read.append(&mut buf[0..n].to_vec());
                 if let Some(i) = read.iter().position(|&b| b == b'\n' || b == b'\r') {
