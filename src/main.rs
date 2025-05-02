@@ -1,6 +1,6 @@
 use log::{trace, debug, info, warn, error};
 
-use std::sync::atomic::AtomicU8;
+use std::sync::atomic::{AtomicU8, AtomicBool};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -39,7 +39,7 @@ struct MpdQueryState {
     command_list_ended: bool,
     command_list_count: usize,
     command_list_failed: bool,
-    last_idle_player_state: Option<PlayerState>,
+    last_idle_player_state: Option<PlayerStateForIdle>,
     last_idle_playlist_state: Option<PlayerState>,
     last_idle_mixer_state: Option<u8>,
     should_close: bool,
@@ -55,9 +55,19 @@ struct PlayerState {
     art_url: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct PlayerStateForIdle {
+    playback_status: mpris::PlaybackStatus,
+    title: Option<String>,
+    artist: Option<String>,
+    art_url: Option<String>,
+    single: bool,
+}
+
 struct MpdSharedState {
-    null_volume: AtomicU8,
     player_state: Arc<RwLock<Option<PlayerState>>>,
+    null_volume: AtomicU8,
+    single_oneshot: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -114,7 +124,11 @@ async fn main() -> anyhow::Result<()> {
     let shared_state = Arc::new(MpdSharedState {
         player_state: player_state.clone(),
         null_volume: AtomicU8::new(0),
+        single_oneshot: AtomicBool::new(false),
     });
+
+    let shared_state_mpris = shared_state.clone();
+    let command_tx_mpris = command_tx.clone();
 
     // Accept incoming MPD clients
     tokio::spawn(async move {
@@ -138,7 +152,7 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 let mut state = MpdQueryState {
-                    command_tx: command_tx,
+                    command_tx,
                     in_command_list: false,
                     in_command_list_ok: false,
                     command_list_ended: false,
@@ -181,7 +195,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Observe and control local MPRIS player
-    observe_mpris(command_rx, player_state).await;
+    observe_mpris(command_tx_mpris, command_rx, shared_state_mpris).await;
 
     Ok(())
 }
@@ -205,13 +219,17 @@ fn try_set_player_state(
     }
 }
 
-async fn observe_mpris(mut command_rx: mpsc::Receiver<Command>, player_state: Arc<RwLock<Option<PlayerState>>>) {
+async fn observe_mpris(
+    command_tx: mpsc::Sender<Command>,
+    mut command_rx: mpsc::Receiver<Command>,
+    shared_state: Arc<MpdSharedState>,
+) {
     let fail_delay = Duration::from_millis(1500);
     let poll_delay = Duration::from_millis(1000);
     let mut last_connect_err = None;
     let mut last_emitted_player_state = None;
     loop {
-        try_set_player_state(&player_state, None, &mut last_emitted_player_state);
+        try_set_player_state(&shared_state.player_state, None, &mut last_emitted_player_state);
         let mut player = match find_mpris_player() {
             Ok(player) => player,
             Err(e) => {
@@ -285,11 +303,25 @@ async fn observe_mpris(mut command_rx: mpsc::Receiver<Command>, player_state: Ar
                 elapsed: player.get_position().map(|d| d.as_secs_f32()).ok(),
                 art_url: metadata.art_url().map(|u| u.into()),
             };
-            try_set_player_state(&player_state, Some(state), &mut last_emitted_player_state);
+            let state = Some(state);
+            if shared_state.single_oneshot.load(Ordering::SeqCst) &&
+                state.as_ref().map(|s| get_state_for_single_oneshot(s)) != last_emitted_player_state.as_ref().map(|s| get_state_for_single_oneshot(s)
+            ) {
+                match command_tx.send(Command::Stop).await {
+                    Ok(_) => {
+                        info!("Enqueued pending single oneshot stop");
+                        shared_state.single_oneshot.store(false, Ordering::SeqCst);
+                    }
+                    Err(e) => error!("Enqueuing pending single oneshot stop failed: {e}"),
+                }
+            }
+            try_set_player_state(&shared_state.player_state, state, &mut last_emitted_player_state);
             // If this player is not playing, need to check if another is
             if playback_status != mpris::PlaybackStatus::Playing {
                 if let Ok(new_player) = find_mpris_player() {
-                    if new_player.unique_name() != player.unique_name() {
+                    if new_player.unique_name() != player.unique_name() &&
+                        Some(mpris::PlaybackStatus::Playing) == new_player.get_playback_status().ok()
+                    {
                         info!("Switching active player to {new_player:?}");
                         player = new_player;
                     }
@@ -406,6 +438,7 @@ async fn handle_mpd_query(
         }
         b"next" => handle_next(state).await,
         b"previous" => handle_previous(state).await,
+        b"single" => handle_single(arguments, shared_state),
         // Infos
         b"currentsong" => handle_current_song(shared_state),
         b"status" => handle_status(shared_state),
@@ -428,9 +461,10 @@ async fn handle_mpd_query(
             Ok(Vec::new())
         }
         // Silently ignored commands
-        b"playlistinfo" => handle_dummy("playlistinfo"),
-        b"lsinfo" => handle_dummy("lsinfo"),
-        b"stats" => handle_dummy("stats"),
+        b"playlistinfo" => handle_dummy("playlistinfo", arguments),
+        b"repeat" => handle_dummy("repeat", arguments),
+        b"lsinfo" => handle_dummy("lsinfo", arguments),
+        b"stats" => handle_dummy("stats", arguments),
         b"close" => {
             state.should_close = true;
             Ok(Vec::new())
@@ -438,7 +472,7 @@ async fn handle_mpd_query(
         b"volume" => handle_volume(arguments, shared_state),
         b"setvol" => handle_setvol(arguments, shared_state),
         b"getvol" => handle_getvol(shared_state),
-        b"noidle" => handle_dummy("noidle"),
+        b"noidle" => handle_dummy("noidle", arguments),
         _ => handle_unknown_command(command)
     };
     result.map_err(|e|
@@ -471,6 +505,7 @@ fn handle_commands() -> anyhow::Result<Vec<u8>> {
         command: playlistinfo\n\
         command: previous\n\
         command: setvol\n\
+        command: single\n\
         command: stats\n\
         command: status\n\
         command: stop\n\
@@ -514,6 +549,25 @@ async fn handle_previous(state: &mut MpdQueryState) -> anyhow::Result<Vec<u8>> {
     state.command_tx.send(Command::Prev).await?;
     debug!("Ack prev action");
     Ok(Vec::new())
+}
+
+fn handle_single(arguments: &[u8], shared_state: Arc<MpdSharedState>) -> anyhow::Result<Vec<u8>> {
+    let arguments = std::str::from_utf8(&arguments)?;
+    debug!("Handling single: {arguments}");
+    match arguments {
+        "0" | "\"0\"" => {
+            shared_state.single_oneshot.store(false, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+        "1" | "\"1\"" | "oneshot" | "\"oneshot\"" => {
+            shared_state.single_oneshot.store(true, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+        _ => {
+            warn!("Ignore unsupported single argument: {arguments}");
+            Err(anyhow::anyhow!("Unsupported single arguments {arguments}"))
+        }
+    }
 }
 
 fn handle_current_song(shared_state: Arc<MpdSharedState>) -> anyhow::Result<Vec<u8>> {
@@ -570,12 +624,18 @@ fn handle_status(shared_state: Arc<MpdSharedState>) -> anyhow::Result<Vec<u8>> {
         mpris::PlaybackStatus::Stopped => "stop",
     };
 
+    let single = match shared_state.single_oneshot.load(Ordering::SeqCst) {
+        true => "oneshot",
+        false => "0",
+    };
+
     let response: &mut Vec<u8> =
         &mut format!(
             "repeat: 0\n\
              random: 0\n\
              song: 0\n\
              playlistlength: 1\n\
+             single: {single}\n\
              volume: {volume}\n\
              state: {state}\n"
         ).into();
@@ -596,15 +656,14 @@ fn handle_status(shared_state: Arc<MpdSharedState>) -> anyhow::Result<Vec<u8>> {
     Ok(response.to_vec())
 }
 
-fn get_state_for_idle_player(player_state: &PlayerState) -> PlayerState {
+fn get_state_for_idle_player(player_state: &PlayerState, shared_state: &MpdSharedState) -> PlayerStateForIdle {
     // Just a subset of values interesting for the idle command
-    PlayerState {
+    PlayerStateForIdle {
         playback_status: player_state.playback_status,
         title: player_state.title.clone(),
         artist: player_state.artist.clone(),
-        duration: None,
-        elapsed: None,
         art_url: player_state.art_url.clone(),
+        single: shared_state.single_oneshot.load(Ordering::SeqCst),
     }
 }
 
@@ -618,6 +677,10 @@ fn get_state_for_idle_playlist(player_state: &PlayerState) -> PlayerState {
         elapsed: None,
         art_url: None,
     }
+}
+
+fn get_state_for_single_oneshot(player_state: &PlayerState) -> (Option<String>, Option<String>) {
+    (player_state.title.clone(), player_state.artist.clone())
 }
 
 async fn handle_idle(
@@ -644,7 +707,7 @@ async fn handle_idle(
                 .map(|inner| inner.clone())
                 .flatten();
             if idle_player {
-                let current_state = current_raw_state.as_ref().map(|state| get_state_for_idle_player(state));
+                let current_state = current_raw_state.as_ref().map(|state| get_state_for_idle_player(state, &shared_state));
                 if current_state != state.last_idle_player_state {
                     info!("Handling idle finished with player status change");
                     state.last_idle_player_state = current_state;
@@ -727,7 +790,10 @@ fn handle_unknown_command(command: &[u8]) -> anyhow::Result<Vec<u8>> {
     Err(anyhow::anyhow!("Unknown command: {safe_command}"))
 }
 
-fn handle_dummy(name: &str) -> anyhow::Result<Vec<u8>> {
-    debug!("Handling dummy action {name}");
+fn handle_dummy(name: &str, arguments: &[u8]) -> anyhow::Result<Vec<u8>> {
+    match std::str::from_utf8(&arguments) {
+        Ok(arguments) => debug!("Handling dummy action {name} {arguments}"),
+        Err(_) => debug!("Handling dummy action {name}"),
+    }
     Ok(Vec::new())
 }
