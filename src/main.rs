@@ -225,7 +225,9 @@ async fn observe_mpris(
     shared_state: Arc<MpdSharedState>,
 ) {
     let fail_delay = Duration::from_millis(1500);
-    let poll_delay = Duration::from_millis(1000);
+    let slow_poll_delay = Duration::from_millis(1000);
+    let fast_poll_delay = Duration::from_millis(100);
+    let mut poll_delay = slow_poll_delay;
     let mut last_connect_err = None;
     let mut last_emitted_player_state = None;
     loop {
@@ -304,16 +306,19 @@ async fn observe_mpris(
                 art_url: metadata.art_url().map(|u| u.into()),
             };
             let state = Some(state);
-            if shared_state.single_oneshot.load(Ordering::SeqCst) &&
-                state.as_ref().map(|s| get_state_for_single_oneshot(s)) != last_emitted_player_state.as_ref().map(|s| get_state_for_single_oneshot(s)
-            ) {
-                match command_tx.send(Command::Stop).await {
-                    Ok(_) => {
-                        info!("Enqueued pending single oneshot stop");
-                        shared_state.single_oneshot.store(false, Ordering::SeqCst);
+            if shared_state.single_oneshot.load(Ordering::SeqCst) {
+                if state.as_ref().map(|s| get_state_for_single_oneshot(s)) != last_emitted_player_state.as_ref().map(|s| get_state_for_single_oneshot(s)) {
+                    match command_tx.send(Command::Pause).await {
+                        Ok(_) => {
+                            info!("Enqueued pending single oneshot pause");
+                            shared_state.single_oneshot.store(false, Ordering::SeqCst);
+                        }
+                        Err(e) => error!("Enqueuing pending single oneshot pause failed: {e}"),
                     }
-                    Err(e) => error!("Enqueuing pending single oneshot stop failed: {e}"),
                 }
+                poll_delay = fast_poll_delay;
+            } else {
+                poll_delay = slow_poll_delay;
             }
             try_set_player_state(&shared_state.player_state, state, &mut last_emitted_player_state);
             // If this player is not playing, need to check if another is
